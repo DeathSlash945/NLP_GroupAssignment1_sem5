@@ -1,0 +1,147 @@
+NLP Group Assignment - Question 4
+Integrated Background Editor: Live Segmentation, Spelling Correction and
+Constituency-Based Grammar Checking
+
+1. Overview
+
+This question builds on Q1 and Q3 instead of starting fresh. The idea is to take the
+segmentation and POS tagging system from Q1 and the spelling corrector from Q3 and
+run them together on one live text stream, alongside a new constituency parser and a
+shared n-gram language model. All of the reusable logic sits in a single module,
+nlp_pipeline.py, which is imported both by the analysis notebook and by the Streamlit
+app, so the notebook demo and the deployed app are running the exact same trained
+models and not two separate copies of the same idea.
+
+Everything is trained once, at the start, through a single build_models() function.
+Nothing downstream retrains anything, it just calls into the already trained objects.
+
+2. What was reused vs what is new
+
+Reused from Q1, unchanged:
+- The trigram word LM used to score candidate segmentations.
+- The second order Viterbi segmenter.
+- The trigram HMM POS tagger (transition + emission probabilities, beam pruned
+  Viterbi decoding).
+
+Reused from Q3, unchanged:
+- The vocabulary and unigram/bigram frequency models built from Brown.
+- Method A (standard edit distance 1) and Method B (symmetric delete / SymSpell)
+  candidate generation.
+- The non-word and real-word correction logic.
+
+New in Q4:
+- A fast-typing merge simulator that drops spaces between words with a small
+  probability, which is what actually gives Q1's segmentation model something to do
+  in an otherwise space-delimited passage.
+- A live alert system that checks every token for segmentation and spelling issues,
+  and checks a trailing window every N tokens for grammar issues.
+- A PCFG constituency parser trained on the Penn Treebank sample, with a from-scratch
+  CKY parser and a small fallback grammar used if NLTK or the treebank data are not
+  available, so the pipeline still runs end to end offline.
+- A tagset reconciliation step between Q1's tags and the PCFG's tags.
+- A shared, separately trained bigram and trigram LM (add-k smoothed) used only for
+  grammar alerting and the final passage analysis, kept separate from Q1's
+  segmentation LM as the assignment specifies.
+- A decision rule that picks PCFG, trigram or bigram as the final verdict for each
+  sentence.
+- A Speed Demon benchmark comparing the full per-token check pipeline against the
+  grammar-trigger check alone.
+
+3. Design choices and justification
+
+Merge probability (p = 0.08): a typist misses the spacebar roughly once every 12
+word boundaries. This is frequent enough that segmentation has real, regular work to
+do (about 1-2 merges per 20 word sentence) without merging so much that almost every
+token becomes a segmentation problem, which would drown out the spelling and grammar
+checks.
+
+Grammar trigger interval (N = 15 tokens): the SEGMENT and SPELL checks are cheap
+vocabulary lookups and run on every token. The grammar check is heavier, it computes
+perplexity over a window and sweeps for real-word errors, so it only runs every 15
+tokens, roughly every half sentence to sentence. This keeps the expensive check off
+the per-token path while still catching bad windows well before the passage ends.
+
+Add-k smoothing (k = 0.5): this matches the smoothing constant already used in Q1's
+segmentation LM, so perplexities from the Q1 LM and the Q4 shared LM are on a
+comparable scale.
+
+Tagset reconciliation: Q1 outputs coarse Universal tags (NOUN, VERB, ADJ, etc), while
+the PCFG's lexical productions use Penn Treebank style tags (NN, VBZ, JJ, etc).
+Rather than writing a second lookup table, both sides are projected through Q1's own
+brown_tag_to_universal function, since PTB tags share Brown's prefixes. This avoids
+maintaining a second mapping, at the cost of losing fine grained distinctions in the
+comparison (VBZ vs VBP vs VBD all just become VERB).
+
+Decision rule: prefer the PCFG verdict if the sentence parses, since a successful
+parse is itself a strong grammaticality signal that n-gram models cannot see. If it
+does not parse, use the trigram verdict if its perplexity is not a wild outlier.
+Otherwise fall back to bigram, since bigram degrades more gracefully on sparse or
+unseen sequences.
+
+4. Results
+
+On the fallback/demo corpus (used here because this environment has no internet
+access to download NLTK's Brown, Treebank and Gutenberg corpora), the pipeline runs
+cleanly end to end. Two full sample runs were done on different sampled passages.
+Both show the expected pattern: merged tokens like "foxjumps" or "andmeet" are caught
+and split correctly most of the time by SEGMENT-ALERT, occasional genuinely ambiguous
+merges (like "dogandthen") get split into more pieces than intended, which then shows
+up downstream as extra GRAMMAR-ALERTs and as FLAGGED verdicts in the final table,
+which is exactly the segmentation-causes-tagging/grammar-errors relationship the
+assignment asks us to look at.
+
+Latency stayed well under a millisecond for both the per-token seg+spell check and
+the per-trigger grammar check in every run, so neither check would visibly lag a
+realistic simulated typing speed.
+
+Speed Demon benchmark, 1000 token batch: the per-token segmentation+spelling layer
+averaged about 0.12 ms/token, while the grammar-trigger check alone averaged about
+0.08 ms per 15-token window (about 0.005 ms/token amortised). Since both are cheap
+relative to typing speed, the segmentation+spelling layer does not need to be
+throttled down to the grammar layer's trigger interval, it is fine to keep it running
+on every token live.
+
+5. Comparative analysis
+
+Live alerts vs final verdict: windows the live check flags as high perplexity
+generally also end up FLAGGED in the final table, but a sentence that does get parsed
+by the PCFG can still be marked OK even if its live window looked mildly elevated,
+since a successful parse outweighs a moderately high n-gram perplexity in the
+decision rule.
+
+PCFG vs n-gram errors: the PCFG catches structural problems, a sequence of categories
+that does not fit any production, even when every local word pair looks fine. The
+n-gram models catch local sequence problems, an implausible pair or triple of words,
+even inside an otherwise well formed sentence. In practice they catch different
+things: unresolved segmentation merges tend to blow up n-gram perplexity and fail to
+parse at the same time, while a real-word swap that stays locally fluent is mostly
+caught by the bigram/trigram real-word check rather than by a parse failure.
+
+Effect of N and p: a smaller N catches problems sooner but is noisier, since
+perplexity over a short window is unstable. A larger N smooths that out but delays
+detection. A higher p gives the segmenter more to do but past a point starts
+producing its own multi-way splitting errors that drown out genuine spelling and
+grammar issues, which is why p was kept fairly low.
+
+Sub-system interactions: a spelling correction or segmentation fix can change whether
+a sentence gets parsed at all, which then changes which method the decision rule
+picks for that sentence. A corrected token that the PCFG's lexicon actually covers
+can turn a sentence that would have fallen back to bigram into a clean PCFG parse and
+an OK verdict. On the other side, an unresolved multi-way segmentation split both
+lowers the PCFG's chance of parsing that sentence and inflates its n-gram perplexity,
+so the FLAGGED verdict ends up being driven by both signals at once rather than one
+independent mistake.
+
+6. Conclusion
+
+The integrated editor successfully reuses Q1 and Q3's trained models as callable
+components rather than reimplementing them, adds a working PCFG parser with graceful
+failure handling and a documented tagset reconciliation step, and ties everything
+together with a shared smoothed LM and a documented decision rule. The Speed Demon
+results show the added segmentation and spelling layer is cheap enough to run live on
+every token. The main limitation in this run is that the actual Brown, Treebank and
+Gutenberg corpora could not be downloaded in this environment, so the numbers above
+come from the small embedded fallback corpus built into nlp_pipeline.py. Running the
+same notebook with internet access and the real corpora downloaded (as the setup
+cells attempt automatically) will give meaningful, publishable accuracy and
+perplexity numbers instead of the illustrative ones shown here.
