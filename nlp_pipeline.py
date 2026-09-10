@@ -64,7 +64,7 @@ EOS = "</s>"
 
 MERGE_PROB = 0.08
 GRAMMAR_TRIGGER_N = 15
-ADD_K = 0.5
+ADD_K = 0.001
 PERPLEXITY_ALERT_MULTIPLIER = 2.5   # window flagged if its perplexity is this many
                                      # times the LM's own average training perplexity
 REALWORD_THRESHOLD = 2.0            # matches Q3's correct_realword threshold
