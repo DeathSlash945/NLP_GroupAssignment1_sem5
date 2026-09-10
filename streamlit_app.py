@@ -35,7 +35,7 @@ try:
 except ImportError:
     HAS_KEYUP = False
 
-st.set_page_config(page_title="NLP Q4 — Live Background Editor", layout="wide")
+st.set_page_config(page_title="NLP Live Background Editor", layout="wide")
 
 
 # ----------------------------------------------------------------------
@@ -91,7 +91,7 @@ st.caption(
 )
 
 tab_live, tab_sim, tab_analysis = st.tabs(
-    ["✍️ Live typing", "🔁 Simulated typing", "📊 Final passage analysis"]
+    ["Live typing", "Simulated typing", "Final passage analysis"]
 )
 
 
@@ -99,7 +99,7 @@ def render_new_alerts():
     alerts = st.session_state.session.alerts
     new = alerts[st.session_state.n_alerts_shown:]
     for a in new:
-        icon = {"SEGMENT-ALERT": "🔀", "SPELL-ALERT": "✏️", "GRAMMAR-ALERT": "📐"}.get(a["type"], "⚠️")
+        icon = {"SEGMENT-ALERT": "segment_alert", "SPELL-ALERT": "spell_alert", "GRAMMAR-ALERT": "grammar_alert"}.get(a["type"], "Warning")
         st.write(f"{icon} **[{a['type']}]** {a['message']}")
     st.session_state.n_alerts_shown = len(alerts)
 
