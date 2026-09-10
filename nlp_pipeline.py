@@ -44,7 +44,7 @@ constants rather than re-justifying them):
       Speed-Demon benchmark below shows grammar-check latency staying well
       under the simulated per-word typing delay.
 
-  ADD_K (smoothing) = 0.5
+  ADD_K (smoothing) = 0.001
       Matches the smoothing constant already used for the Q1 segmentation
       trigram LM, so perplexities from the Q4 shared LM and the Q1 LM are on
       a comparable scale.
