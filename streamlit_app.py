@@ -11,8 +11,6 @@ not a separate re-implementation.
 Run locally:
     pip install -r requirements.txt
     streamlit run streamlit_app.py
-
-Deploy on Streamlit Community Cloud: see README.md.
 """
 
 import random
