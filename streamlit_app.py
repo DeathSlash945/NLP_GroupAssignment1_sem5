@@ -11,6 +11,8 @@ not a separate re-implementation.
 Run locally:
     pip install -r requirements.txt
     streamlit run streamlit_app.py
+
+Deploy on Streamlit Community Cloud: see README.md.
 """
 
 import random
@@ -21,7 +23,19 @@ import streamlit as st
 
 import nlp_pipeline as P
 
-st.set_page_config(page_title="NLP Q4 Live Background Editor", layout="wide")
+# Optional true per-keystroke input widget. `st.text_area` only reruns the script on
+# blur / Ctrl+Enter (a Streamlit platform limitation, not something fixable from user
+# code), so for genuinely live, per-keystroke processing we use the `streamlit-keyup`
+# component when it's installed, which fires on every keystroke (debounced). If it
+# isn't installed, we fall back to the plain `text_area` behaviour below rather than
+# crashing the app.
+try:
+    from streamlit_keyup import st_keyup
+    HAS_KEYUP = True
+except ImportError:
+    HAS_KEYUP = False
+
+st.set_page_config(page_title="NLP Q4 — Live Background Editor", layout="wide")
 
 
 # ----------------------------------------------------------------------
@@ -77,7 +91,7 @@ st.caption(
 )
 
 tab_live, tab_sim, tab_analysis = st.tabs(
-    ["Live typing", "Simulated typing", "Final passage analysis"]
+    ["✍️ Live typing", "🔁 Simulated typing", "📊 Final passage analysis"]
 )
 
 
@@ -85,7 +99,7 @@ def render_new_alerts():
     alerts = st.session_state.session.alerts
     new = alerts[st.session_state.n_alerts_shown:]
     for a in new:
-        icon = {"SEGMENT-ALERT": "segment_alert", "SPELL-ALERT": "spell_alert", "GRAMMAR-ALERT": "grammar_alert"}.get(a["type"], "Warning")
+        icon = {"SEGMENT-ALERT": "🔀", "SPELL-ALERT": "✏️", "GRAMMAR-ALERT": "📐"}.get(a["type"], "⚠️")
         st.write(f"{icon} **[{a['type']}]** {a['message']}")
     st.session_state.n_alerts_shown = len(alerts)
 
@@ -94,11 +108,22 @@ def render_new_alerts():
 # Tab 1: live typing -- incremental processing of real user input
 # ----------------------------------------------------------------------
 with tab_live:
-    st.markdown(
-        "Type into the box below. New whitespace-delimited tokens are processed **incrementally** as "
-        "you type (not only once you submit the whole passage) -- exactly as required."
-    )
-    text = st.text_area("Type your passage here:", height=120, key="live_text_input")
+    if HAS_KEYUP:
+        st.markdown(
+            "Type into the box below. Tokens are processed **incrementally on every keystroke** "
+            "(debounced ~300ms via `streamlit-keyup`), not only when you press Ctrl+Enter."
+        )
+        text = st_keyup("Type your passage here:", key="live_text_input", debounce=300)
+        text = text or ""
+    else:
+        st.markdown(
+            "Type into the box below. New whitespace-delimited tokens are processed **incrementally** "
+            "once you commit input (blur the box or press Ctrl+Enter). *Note: `streamlit-keyup` isn't "
+            "installed, so this falls back to `st.text_area`'s default commit-on-blur behaviour rather "
+            "than true per-keystroke updates -- install `streamlit-keyup` (see requirements.txt) for "
+            "genuinely live typing.*"
+        )
+        text = st.text_area("Type your passage here:", height=120, key="live_text_input")
 
     if text != st.session_state.typed_so_far:
         already_processed = st.session_state.typed_so_far.split()

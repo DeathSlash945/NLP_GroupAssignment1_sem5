@@ -1,3 +1,4 @@
 nltk>=3.8
 pandas>=2.0
 streamlit>=1.32
+streamlit-keyup>=0.2.0
