@@ -790,16 +790,34 @@ def reconcile_tags(q1_word_tag_pairs, pcfg_tree):
 
 # ---- Decision rule (Part 4) --------------------------------------------
 
-def choose_verdict(pcfg_logprob, bigram_ppl, trigram_ppl, ppl_alert_threshold):
-    """1. If the PCFG parsed the sentence, prefer it (a parse is a structural signal).
-       2. Else use the trigram verdict if its perplexity is not a wild outlier.
-       3. Else fall back to bigram (degrades more gracefully on sparse sequences)."""
+def count_suspect_tokens(sentence, vocab):
+    """Tokens that cannot be real words: out of the Brown vocabulary, or a single letter
+    other than 'a'/'i' (the vocabulary itself contains stray letters). The PCFG maps unknown
+    words to <unk>, which parses as any open-class tag, so junk would otherwise parse."""
+    return sum(1 for w in sentence if w not in vocab or (len(w) == 1 and w not in ("a", "i")))
+
+
+def choose_verdict(pcfg_logprob, bigram_ppl, trigram_ppl, ppl_alert_threshold, n_suspect=0):
+    """Documented decision rule:
+       1. If the PCFG parsed the sentence, it is the chosen method. A parse is NECESSARY but
+          not SUFFICIENT: parse log-probability does not separate junk from real text (the
+          grammar is permissive and <unk> parses as anything), so the verdict is OK only if
+          there are also no suspect tokens and the trigram perplexity is under the
+          held-out threshold. A failed parse is never OK.
+       2. Else, if the trigram model has adequate coverage (perplexity not a wild outlier,
+          below 3x the threshold), use the trigram verdict.
+       3. Else fall back to the bigram verdict (degrades more gracefully on sparse input).
+       In rules 2 and 3 suspect tokens also force FLAGGED.
+    """
+    clean = n_suspect == 0
     if pcfg_logprob is not None:
-        method, grammatical = "PCFG", True
+        method = "PCFG"
+        grammatical = clean and trigram_ppl is not None and trigram_ppl < ppl_alert_threshold
     elif trigram_ppl is not None and trigram_ppl < ppl_alert_threshold * 3:
-        method, grammatical = "trigram", trigram_ppl < ppl_alert_threshold
+        method, grammatical = "trigram", clean and trigram_ppl < ppl_alert_threshold
     else:
-        method, grammatical = "bigram", bigram_ppl is not None and bigram_ppl < ppl_alert_threshold
+        method = "bigram"
+        grammatical = clean and bigram_ppl is not None and bigram_ppl < ppl_alert_threshold
     return method, ("OK" if grammatical else "FLAGGED")
 
 
@@ -1047,7 +1065,8 @@ def analyze_passage(session: LiveEditorSession, models: Models):
         tree, pcfg_lp = parse_with_pcfg(sent, models.pcfg_grammar)
         bi_ppl = models.q4_bigram_lm.perplexity(sent)
         tri_ppl = models.q4_trigram_lm.perplexity(sent)
-        method, verdict = choose_verdict(pcfg_lp, bi_ppl, tri_ppl, threshold)
+        n_suspect = count_suspect_tokens(sent, models.spelling.vocab)
+        method, verdict = choose_verdict(pcfg_lp, bi_ppl, tri_ppl, threshold, n_suspect)
         rows.append({
             "sentence": " ".join(sent),
             "pcfg_result": f"{pcfg_lp:.2f}" if pcfg_lp is not None else "unparseable",
@@ -1055,6 +1074,7 @@ def analyze_passage(session: LiveEditorSession, models: Models):
             "trigram_ppl": round(tri_ppl, 1),
             "chosen_method": method,
             "verdict": verdict,
+            "suspect_tokens": n_suspect,
             "segmentation_merges_resolved": sum(1 for m_, _ in events if m_),
             "spelling_corrections_applied": sum(1 for _, s_ in events if s_),
         })
