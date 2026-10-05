@@ -956,11 +956,33 @@ class LiveEditorSession:
         self.n_segmentation_merges_resolved = 0
         self.n_spelling_corrections = 0
         self.boundaries = set()     # token indices where a typed sentence ended
+        self._sent_start = 0        # index in all_tokens where the current sentence began
 
     def _mark_boundary(self):
         n = len(self.all_tokens)
-        if n:
+        if n and n not in self.boundaries:
             self.boundaries.add(n)
+            self._check_sentence(self.all_tokens[self._sent_start:n])
+            self._sent_start = n
+
+    def _check_sentence(self, sent):
+        """Sentence-level GRAMMAR-ALERT, run when a sentence ends (or on flush). The N-token
+        window check cannot fire on a short sentence, and perplexity alone misses fragments."""
+        if len(sent) < 2:
+            return
+        m, reasons = self.m, []
+        if m.pcfg_from_real_treebank and parse_with_pcfg(sent, m.pcfg_grammar)[1] is None:
+            reasons.append("PCFG could not parse it")
+        ppl = m.q4_trigram_lm.perplexity(sent)
+        if ppl > m.sentence_ppl_threshold:
+            reasons.append(f"trigram-ppl {ppl:.1f} > threshold {m.sentence_ppl_threshold:.0f}")
+        if m.hmm.viterbi_tag(sent)[-1] in ("ADP", "DET", "CONJ", "PRT"):
+            reasons.append(f"ends on function word '{sent[-1]}', looks incomplete")
+        if count_suspect_tokens(sent, m.spelling.vocab):
+            reasons.append("contains suspect tokens")
+        if reasons:
+            self.alerts.append({"type": "GRAMMAR-ALERT", "token": None,
+                                "message": f"sentence '{' '.join(sent)}' flagged: " + "; ".join(reasons)})
 
     def process_token(self, raw_token):
         """Run SEGMENT-ALERT then SPELL-ALERT on one raw token; returns [(word, tag)].
@@ -1062,6 +1084,10 @@ class LiveEditorSession:
         if self._since_trigger > 0:
             self._run_grammar_check()
             self._since_trigger = 0
+        n = len(self.all_tokens)
+        if n > self._sent_start:
+            self._check_sentence(self.all_tokens[self._sent_start:n])
+            self._sent_start = n
 
     def latency_report(self):
         def avg(xs):
