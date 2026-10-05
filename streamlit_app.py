@@ -134,18 +134,40 @@ with tab_live:
         )
         text = st.text_area("Type your passage here:", height=120, key=key)
 
+    ss.live_last_text = text
     tokens = text.split()
-    # the last token is only final once the text ends in whitespace
-    finished = tokens if text.endswith((" ", "\n", "\t")) else tokens[:-1]
+    ends_ws = text.endswith((" ", "\n", "\t"))
+    finalized = ss.get("live_final_text") == text      # user pressed "Finish passage"
+    # the last token is only committed once whitespace follows (it may be half-typed),
+    # or when the user finishes the passage
+    finished = tokens if (ends_ws or finalized) else tokens[:-1]
+    pending = None if (ends_ws or finalized or not tokens) else tokens[-1]
     prev = ss.live_tokens
     if finished[:len(prev)] != prev:      # user edited earlier text: re-check from scratch
         ss.live_session = new_session()
+        ss.live_flushed_for = None
         prev = []
     for tok in finished[len(prev):]:
         ss.live_session.process_token(tok)
     ss.live_tokens = finished
+    if finalized and ss.get("live_flushed_for") != text:
+        ss.live_session.flush()               # grammar-check the trailing partial window
+        ss.live_flushed_for = text
+
+    def finish_live():
+        ss.live_final_text = ss.live_last_text
+
+    st.button("Finish passage (commit last word + final grammar check)", on_click=finish_live)
 
     st.subheader("Live alerts")
+    if pending:
+        tmp = new_session()                   # throwaway: preview only, not committed
+        tmp.process_token(pending)
+        if tmp.alerts:
+            for a in tmp.alerts:
+                st.info(f"Pending word '{pending}' (not committed yet): **[{a['type']}]** {a['message']}")
+        else:
+            st.caption(f"Pending word '{pending}' looks fine so far. Press space to commit it.")
     with st.container(height=320):
         render_alerts(ss.live_session)
     show_metrics(ss.live_session)

@@ -1057,6 +1057,12 @@ class LiveEditorSession:
                     })
         self.grammar_latencies.append(time.perf_counter() - t0)
 
+    def flush(self):
+        """Grammar-check any trailing words that have not reached the N-token trigger."""
+        if self._since_trigger > 0:
+            self._run_grammar_check()
+            self._since_trigger = 0
+
     def latency_report(self):
         def avg(xs):
             return (sum(xs) / len(xs) * 1000) if xs else 0.0
