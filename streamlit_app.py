@@ -3,16 +3,12 @@ streamlit_app.py
 =================
 Live deployment of the Q4 integrated background editor.
 
-Imports `nlp_pipeline.py` directly -- the exact same module used by
-`Group_Assignment_Q4.ipynb` -- so this app is provably running the same
-trained Q1/Q3 models and the same alert logic demonstrated in the notebook,
-not a separate re-implementation.
+Imports `nlp_pipeline.py` directly (the same module used by Group_Assignment_Q4.ipynb),
+so the app runs the same trained Q1/Q3 models and alert logic as the notebook.
 
 Run locally:
     pip install -r requirements.txt
     streamlit run streamlit_app.py
-
-Deploy on Streamlit Community Cloud: see README.md.
 """
 
 import random
@@ -23,12 +19,8 @@ import streamlit as st
 
 import nlp_pipeline as P
 
-# Optional true per-keystroke input widget. `st.text_area` only reruns the script on
-# blur / Ctrl+Enter (a Streamlit platform limitation, not something fixable from user
-# code), so for genuinely live, per-keystroke processing we use the `streamlit-keyup`
-# component when it's installed, which fires on every keystroke (debounced). If it
-# isn't installed, we fall back to the plain `text_area` behaviour below rather than
-# crashing the app.
+# `st.text_area` only reruns on blur / Ctrl+Enter, so for per-keystroke processing we use
+# the `streamlit-keyup` component when installed and fall back to `text_area` otherwise.
 try:
     from streamlit_keyup import st_keyup
     HAS_KEYUP = True
@@ -38,9 +30,6 @@ except ImportError:
 st.set_page_config(page_title="NLP Live Background Editor", layout="wide")
 
 
-# ----------------------------------------------------------------------
-# Model loading (cached -- trained once per deployment, not per interaction)
-# ----------------------------------------------------------------------
 @st.cache_resource(show_spinner="Training Q1 segmentation/POS models, Q3 spelling models, "
                                  "Q4 shared LM and PCFG (only happens once)...")
 def get_models():
@@ -72,7 +61,7 @@ st.sidebar.markdown(
     **Add-k smoothing:** `{P.ADD_K}`
     **PCFG source:** {'Penn Treebank (real)' if models.pcfg_from_real_treebank else 'offline fallback grammar'}
 
-    (See `nlp_pipeline.py` docstring for the justification of each constant.)
+    (See the `nlp_pipeline.py` docstring for the justification of each constant.)
     """
 )
 
@@ -97,10 +86,8 @@ tab_live, tab_sim, tab_analysis = st.tabs(
 
 def render_new_alerts():
     alerts = st.session_state.session.alerts
-    new = alerts[st.session_state.n_alerts_shown:]
-    for a in new:
-        icon = {"SEGMENT-ALERT": "segment_alert", "SPELL-ALERT": "spell_alert", "GRAMMAR-ALERT": "grammar_alert"}.get(a["type"], "Warning")
-        st.write(f"{icon} **[{a['type']}]** {a['message']}")
+    for a in alerts[st.session_state.n_alerts_shown:]:
+        st.write(f"**[{a['type']}]** {a['message']}")
     st.session_state.n_alerts_shown = len(alerts)
 
 
@@ -118,22 +105,21 @@ with tab_live:
     else:
         st.markdown(
             "Type into the box below. New whitespace-delimited tokens are processed **incrementally** "
-            "once you commit input (blur the box or press Ctrl+Enter). *Note: `streamlit-keyup` isn't "
-            "installed, so this falls back to `st.text_area`'s default commit-on-blur behaviour rather "
-            "than true per-keystroke updates -- install `streamlit-keyup` (see requirements.txt) for "
-            "genuinely live typing.*"
+            "once you commit input (blur the box or press Ctrl+Enter). *`streamlit-keyup` isn't "
+            "installed, so this falls back to `st.text_area`'s commit-on-blur behaviour; install it "
+            "(see requirements.txt) for true per-keystroke updates.*"
         )
         text = st.text_area("Type your passage here:", height=120, key="live_text_input")
 
     if text != st.session_state.typed_so_far:
         already_processed = st.session_state.typed_so_far.split()
         now_tokens = text.split()
-        # only process tokens that are new AND no longer being actively edited (i.e. not the last,
-        # possibly-still-being-typed token), so we don't fire alerts on a half-typed word.
-        stable_new_tokens = now_tokens[len(already_processed):-1] if len(now_tokens) > len(already_processed) else []
-        for tok in stable_new_tokens:
+        # Only process tokens that are new AND finished (not the last, possibly half-typed
+        # token), unless the text ends in whitespace, in which case the last token is done.
+        finished = now_tokens if text.endswith((" ", "\n", "\t")) else now_tokens[:-1]
+        for tok in finished[len(already_processed):]:
             st.session_state.session.process_token(tok)
-        st.session_state.typed_so_far = " ".join(now_tokens[:-1]) if now_tokens else ""
+        st.session_state.typed_so_far = " ".join(finished)
 
     st.subheader("Live alerts")
     render_new_alerts()
@@ -146,11 +132,11 @@ with tab_live:
 
 
 # ----------------------------------------------------------------------
-# Tab 2: simulated typing -- auto-play a sampled/pasted passage with merges
+# Tab 2: simulated typing -- auto-play a pasted passage with merges
 # ----------------------------------------------------------------------
 with tab_sim:
     st.markdown(
-        "Paste a passage (or sample one) and watch it 'type itself', word by word, with the "
+        "Paste a passage and watch it 'type itself', word by word, with the "
         f"fast-typing merge simulator (`p={P.MERGE_PROB}`) occasionally dropping a space between words."
     )
     colA, colB = st.columns([3, 1])
@@ -163,7 +149,7 @@ with tab_sim:
         )
     with colB:
         delay = st.slider("Delay per token (s)", 0.0, 0.5, 0.05, 0.05)
-        if st.button("▶ Start / restart simulation"):
+        if st.button("Start / restart simulation"):
             words = passage_text.split()
             st.session_state.sim_tokens = P.simulate_fast_typing_merges(
                 words, p=P.MERGE_PROB, rng=random.Random()
@@ -175,7 +161,7 @@ with tab_sim:
     if st.session_state.sim_tokens:
         placeholder_text = st.empty()
         placeholder_alerts = st.container()
-        typed_display = []
+        typed_display = list(st.session_state.sim_tokens[:st.session_state.sim_idx])
         for tok in st.session_state.sim_tokens[st.session_state.sim_idx:]:
             st.session_state.session.process_token(tok)
             typed_display.append(tok)
@@ -188,18 +174,17 @@ with tab_sim:
 
 
 # ----------------------------------------------------------------------
-# Tab 3: final analysis -- Part 4 per-sentence table
+# Tab 3: final analysis -- per-sentence table
 # ----------------------------------------------------------------------
 with tab_analysis:
     st.markdown("Once you're done typing (either tab), click below for the end-of-passage analysis.")
     if st.button("Run final PCFG / n-gram sentence analysis"):
         session = st.session_state.session
         if not session.all_tokens:
-            st.warning("No tokens processed yet -- type something in the Live typing or Simulated typing tab first.")
+            st.warning("No tokens processed yet. Type something in the Live typing or Simulated typing tab first.")
         else:
             rows = P.analyze_passage(session, models)
-            df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
             rep = session.latency_report()
             st.write(
                 f"**Segmentation merges resolved:** {session.n_segmentation_merges_resolved}  |  "
