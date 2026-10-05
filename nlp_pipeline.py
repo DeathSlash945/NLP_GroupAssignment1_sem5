@@ -39,7 +39,12 @@ MERGE_PROB = 0.08
 GRAMMAR_TRIGGER_N = 15
 ADD_K = 0.5
 PERPLEXITY_ALERT_MULTIPLIER = 2.5   # window flagged if perplexity > this x avg training perplexity
-REALWORD_THRESHOLD = 2.0            # matches Q3's correct_realword threshold
+REALWORD_THRESHOLD = 2.0            # Q3's correct_realword default (used for the Q3 accuracy test)
+LIVE_REALWORD_THRESHOLD = 20.0      # live check runs on EVERY word in a window, so it needs a
+                                     # much stricter bar: 2.0 gave ~1.6 false alerts per 15-word
+                                     # window on clean held-out text, 20 gives ~0.2
+PPL_ALERT_PERCENTILE = 0.95         # alert thresholds are the 95th percentile of perplexity on
+                                     # HELD-OUT windows (about a 5% false-alert rate on clean text)
 
 
 # ======================================================================
@@ -815,6 +820,8 @@ class Models:
         self.pcfg_from_real_treebank = False
         self.avg_train_trigram_ppl = None
         self.avg_train_bigram_ppl = None
+        self.window_ppl_threshold = None     # live GRAMMAR-ALERT threshold (N-token windows)
+        self.sentence_ppl_threshold = None   # end-of-passage threshold (6-12 token sentences)
 
 
 def build_models(max_word_len=12, verbose=True):
@@ -849,12 +856,46 @@ def build_models(max_word_len=12, verbose=True):
     m.avg_train_trigram_ppl = sum(tri_ppls) / max(len(tri_ppls), 1)
     m.avg_train_bigram_ppl = sum(bi_ppls) / max(len(bi_ppls), 1)
 
+    # Alert thresholds are calibrated on HELD-OUT text. The training-set average is far too
+    # low (the LM has seen those sentences), which flagged about half of all clean windows.
+    test_words = [[w for w, _ in s if w.isalpha()] for s in test]
+    test_words = [s for s in test_words if s]
+    cal_rng = random.Random(0)
+
+    def held_out_windows(lo, hi, n=300):
+        out = []
+        for _ in range(n * 3):
+            if len(out) >= n or not test_words:
+                break
+            L = cal_rng.randint(lo, hi)
+            i, w = cal_rng.randrange(len(test_words)), []
+            while i < len(test_words) and len(w) < L:
+                w += test_words[i]
+                i += 1
+            if len(w) >= L:
+                out.append(w[:L])
+        return out
+
+    def percentile_threshold(windows, fallback):
+        if len(windows) < 20:
+            return fallback
+        ppls = sorted(m.q4_trigram_lm.perplexity(w) for w in windows)
+        return ppls[int(PPL_ALERT_PERCENTILE * (len(ppls) - 1))]
+
+    fallback = m.avg_train_trigram_ppl * PERPLEXITY_ALERT_MULTIPLIER
+    m.window_ppl_threshold = percentile_threshold(
+        held_out_windows(GRAMMAR_TRIGGER_N, GRAMMAR_TRIGGER_N), fallback)
+    m.sentence_ppl_threshold = percentile_threshold(held_out_windows(6, 12), fallback)
+
     m.pcfg_grammar, m.pcfg_from_real_treebank = train_pcfg_from_treebank(max_sents=None)
 
     if verbose:
         print(f"Trained on {len(train)} sentences ({sum(len(s) for s in words_sents)} tokens).")
         print(f"Avg training trigram perplexity: {m.avg_train_trigram_ppl:.1f} "
               f"| avg bigram perplexity: {m.avg_train_bigram_ppl:.1f}")
+        print(f"GRAMMAR-ALERT threshold (held-out {PPL_ALERT_PERCENTILE:.0%} percentile): "
+              f"{m.window_ppl_threshold:.0f} per {GRAMMAR_TRIGGER_N}-token window, "
+              f"{m.sentence_ppl_threshold:.0f} per sentence")
     return m, test
 
 
@@ -943,10 +984,10 @@ class LiveEditorSession:
         if len(win) >= 2:
             tri_ppl = self.m.q4_trigram_lm.perplexity(win)
             bi_ppl = self.m.q4_bigram_lm.perplexity(win)
-            threshold = self.m.avg_train_trigram_ppl * PERPLEXITY_ALERT_MULTIPLIER
+            threshold = self.m.window_ppl_threshold
             if tri_ppl > threshold:
                 msg = (f"window {win[:6]}{'...' if len(win) > 6 else ''} "
-                       f"trigram-ppl={tri_ppl:.1f} (baseline~{self.m.avg_train_trigram_ppl:.1f}) "
+                       f"trigram-ppl={tri_ppl:.1f} (threshold~{threshold:.0f}) "
                        f"bigram-ppl={bi_ppl:.1f}")
                 self.alerts.append({"type": "GRAMMAR-ALERT", "token": None,
                                     "message": "implausible window: " + msg})
@@ -954,7 +995,8 @@ class LiveEditorSession:
             # real-word check across the window (Q3-style)
             for i in range(1, len(win) - 1):
                 prev_w, w, next_w = win[i - 1], win[i], win[i + 1]
-                corrected, changed = self.m.spelling.correct_realword(prev_w, w, next_w, method='both')
+                corrected, changed = self.m.spelling.correct_realword(
+                    prev_w, w, next_w, method='both', threshold=LIVE_REALWORD_THRESHOLD)
                 if changed:
                     self.alerts.append({
                         "type": "GRAMMAR-ALERT",
@@ -996,7 +1038,7 @@ def analyze_passage(session: LiveEditorSession, models: Models):
     trigram, apply the decision rule, and build the per-sentence summary rows."""
     sentences = split_into_sentences(session.all_tokens)
     rows = []
-    threshold = models.avg_train_trigram_ppl * PERPLEXITY_ALERT_MULTIPLIER
+    threshold = models.sentence_ppl_threshold
     offset = 0
 
     for sent in sentences:
