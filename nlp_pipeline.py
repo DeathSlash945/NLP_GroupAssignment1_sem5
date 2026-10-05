@@ -11,6 +11,7 @@ Blocks:
   C. Q4 NEW      -- merged-token typing simulator, PCFG parser + tagset reconciliation,
                     decision rule.
   D. ORCHESTRATION -- LiveEditorSession, end-of-passage analysis, Speed-Demon benchmark.
+  E. EXTRAS      -- model cache, random passage sampler, k tuning.
 
 Design choices:
   MERGE_PROB (p) = 0.08   a typist misses the spacebar about once per 12 word boundaries:
@@ -19,8 +20,8 @@ Design choices:
   GRAMMAR_TRIGGER_N = 15  the grammar/real-word check is heavier than the per-token vocab
       lookups, so it runs every 15 tokens (about a sentence). Smaller N catches errors
       sooner but is noisier; larger N delays detection.
-  ADD_K = 0.5             matches the smoothing used for Q1's segmentation LM so
-      perplexities are on a comparable scale.
+  ADD_K = 0.5             default add-k for the Q4 LMs. Run tune_k() (bottom of this file)
+      to choose k by held-out perplexity and report the sweep.
 """
 
 import re
@@ -28,9 +29,8 @@ import math
 import time
 import random
 import string
+import pickle
 from collections import defaultdict, Counter
-
-random.seed(42)
 
 BOS = "<s>"
 EOS = "</s>"
@@ -38,7 +38,7 @@ EOS = "</s>"
 MERGE_PROB = 0.08
 GRAMMAR_TRIGGER_N = 15
 ADD_K = 0.5
-PERPLEXITY_ALERT_MULTIPLIER = 2.5   # window flagged if perplexity > this x avg training perplexity
+PERPLEXITY_ALERT_MULTIPLIER = 2.5   # fallback only: x avg training perplexity
 REALWORD_THRESHOLD = 2.0            # Q3's correct_realword default (used for the Q3 accuracy test)
 LIVE_REALWORD_THRESHOLD = 20.0      # live check runs on EVERY word in a window, so it needs a
                                      # much stricter bar: 2.0 gave ~1.6 false alerts per 15-word
@@ -84,21 +84,14 @@ class TrigramLM:
         self.V = max(len(self.vocab), 1)
 
     def logprob(self, w, u=None, v=None):
-        """log P(w | v, u) with back-off: trigram -> bigram -> unigram."""
+        """log P(w | v, u): trigram if the (v, u) context was seen, else bigram, else unigram.
+        (The original code never backed off because k*V made every denominator > 0.)"""
         k = self.k
-        if u is not None and v is not None:
-            num = self.tri[(v, u, w)] + k
-            den = self.bi[(v, u)] + k * self.V
-            if den > 0:
-                return math.log(num / den)
-        if u is not None:
-            num = self.bi[(u, w)] + k
-            den = self.uni[u] + k * self.V
-            if den > 0:
-                return math.log(num / den)
-        num = self.uni[w] + k
-        den = self.total + k * self.V
-        return math.log(num / max(den, 1e-12))
+        if u is not None and v is not None and self.bi[(v, u)] > 0:
+            return math.log((self.tri[(v, u, w)] + k) / (self.bi[(v, u)] + k * self.V))
+        if u is not None and self.uni[u] > 0:
+            return math.log((self.bi[(u, w)] + k) / (self.uni[u] + k * self.V))
+        return math.log((self.uni[w] + k) / max(self.total + k * self.V, 1e-12))
 
     def sentence_logprob(self, words):
         seq = [BOS, BOS] + list(words) + [EOS]
@@ -136,13 +129,9 @@ class BigramLM:
 
     def logprob(self, w, u=None):
         k = self.k
-        if u is not None:
-            num = self.bi[(u, w)] + k
-            den = self.uni[u] + k * self.V
-            return math.log(num / den)
-        num = self.uni[w] + k
-        den = self.total + k * self.V
-        return math.log(num / max(den, 1e-12))
+        if u is not None and self.uni[u] > 0:
+            return math.log((self.bi[(u, w)] + k) / (self.uni[u] + k * self.V))
+        return math.log((self.uni[w] + k) / max(self.total + k * self.V, 1e-12))
 
     def sentence_logprob(self, words):
         seq = [BOS] + list(words) + [EOS]
@@ -390,6 +379,32 @@ def one_char_deletes(word):
     return {word[:i] + word[i + 1:] for i in range(len(word))}
 
 
+def within_edit1(a, b):
+    """True if a and b are within Damerau edit distance 1 (insert/delete/replace/transpose)."""
+    if a == b:
+        return True
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+    if la == lb:
+        d = [i for i in range(la) if a[i] != b[i]]
+        if len(d) == 1:
+            return True
+        return (len(d) == 2 and d[1] == d[0] + 1
+                and a[d[0]] == b[d[1]] and a[d[1]] == b[d[0]])
+    if la > lb:
+        a, b = b, a
+    i = 0
+    while i < len(a) and a[i] == b[i]:
+        i += 1
+    return a[i:] == b[i + 1:]
+
+
+def is_valid_word(w, vocab):
+    """A split piece counts as a real word only if it is in vocab and not a stray letter."""
+    return w in vocab and (len(w) > 1 or w in ("a", "i"))
+
+
 class SpellingModel:
     """Q3's vocabulary, unigram/bigram counts and both candidate-generation methods."""
 
@@ -431,7 +446,8 @@ class SpellingModel:
         for d in one_char_deletes(word):
             candidates |= self.symspell_dict.get(d, set())
         candidates.discard('')
-        return candidates
+        # delete-delete matches can be edit distance 2 (e.g. abc vs bcd); the task is distance 1
+        return {c for c in candidates if within_edit1(word, c)}
 
     def correct_nonword(self, word, method='b'):
         # Method B is used live by default: query cost is O(word_len) vs Method A's
@@ -499,13 +515,14 @@ def apply_random_edit(word):
 # ======================================================================
 
 def simulate_fast_typing_merges(words, p=MERGE_PROB, rng=None):
-    """Drop the space between consecutive words with probability p."""
+    """Drop the space between consecutive words with probability p.
+    Never merges across a sentence end, so sentence boundaries survive."""
     rng = rng or random
     if not words:
         return []
     out = [words[0]]
     for w in words[1:]:
-        if rng.random() < p:
+        if rng.random() < p and not out[-1].endswith((".", "!", "?")):
             out[-1] = out[-1] + w
         else:
             out.append(w)
@@ -600,7 +617,6 @@ def pcfg_from_nltk(nltk_grammar, start):
     return g
 
 
-
 _TOY_CNF_RULES = {
     "binary": {
         "S": [(("NP", "VP"), 1.0)],
@@ -637,9 +653,11 @@ def _build_fallback_mini_pcfg():
     return g
 
 
-def mini_cky_parse(tokens, grammar: MiniPCFG):
+def mini_cky_parse(tokens, grammar: MiniPCFG, beam=50):
     """Probabilistic CKY with unary closure. Out-of-vocabulary tokens are mapped
-    to UNK. Returns (MiniTree_or_None, logprob_or_None); never raises."""
+    to UNK. Cells are beam-pruned to `beam` entries (except the root cell) so pure-Python
+    CKY stays fast on the full Penn Treebank grammar.
+    Returns (MiniTree_or_None, logprob_or_None); never raises."""
     n = len(tokens)
     if n == 0:
         return None, None
@@ -680,6 +698,9 @@ def mini_cky_parse(tokens, grammar: MiniPCFG):
                             cur = cell.get(lhs)
                             if cur is None or lp > cur[0]:
                                 cell[lhs] = (lp, ("BIN", b, c, k))
+            if span < n and len(cell) > beam:
+                for key, _ in sorted(cell.items(), key=lambda kv: kv[1][0], reverse=True)[beam:]:
+                    del cell[key]
             close_unary(cell)
 
     root = chart[0][n].get(grammar.start)
@@ -847,7 +868,7 @@ def build_models(max_word_len=12, verbose=True):
     m = Models()
 
     english_data = load_english_data()
-    random.shuffle(english_data)
+    random.Random(42).shuffle(english_data)   # fixed train/test split; passages are NOT seeded
     split = int(len(english_data) * 0.8)
     train, test = english_data[:split], english_data[split:]
     if not test:
@@ -934,25 +955,35 @@ class LiveEditorSession:
         self._since_trigger = 0
         self.n_segmentation_merges_resolved = 0
         self.n_spelling_corrections = 0
+        self.boundaries = set()     # token indices where a typed sentence ended
+
+    def _mark_boundary(self):
+        n = len(self.all_tokens)
+        if n:
+            self.boundaries.add(n)
 
     def process_token(self, raw_token):
-        """Run SEGMENT-ALERT then SPELL-ALERT on one raw token; returns [(word, tag)]."""
+        """Run SEGMENT-ALERT then SPELL-ALERT on one raw token; returns [(word, tag)].
+        A raw token ending in . ! or ? also marks a sentence boundary for the final analysis."""
         t0 = time.perf_counter()
+        ends_sentence = raw_token.strip()[-1:] in (".", "!", "?")
         token = re.sub(r"[^a-z]", "", raw_token.lower())
         out_words, events = [], []
+        vocab = self.m.spelling.vocab
 
         if not token:
             self.seg_spell_latencies.append(time.perf_counter() - t0)
+            if ends_sentence:
+                self._mark_boundary()
             return []
 
-        # --- SEGMENT-ALERT ---
-        in_vocab = token in self.m.spelling.vocab
+        # --- SEGMENT-ALERT (all pieces must be valid vocabulary words) ---
         did_split = False
-        if not in_vocab or len(token) >= 10:
-            split_words, split_score = viterbi_segment(
-                token, self.m.seg_lm, self.m.spelling.vocab, self.max_word_len)
-            one_word_score = segmentation_score_as_one_word(token, self.m.seg_lm, self.m.spelling.vocab)
-            if len(split_words) > 1 and split_score > one_word_score:
+        if token not in vocab or len(token) >= 10:
+            split_words, split_score = viterbi_segment(token, self.m.seg_lm, vocab, self.max_word_len)
+            one_word_score = segmentation_score_as_one_word(token, self.m.seg_lm, vocab)
+            if (len(split_words) > 1 and all(is_valid_word(w, vocab) for w in split_words)
+                    and split_score > one_word_score):
                 pred_tags = self.m.hmm.viterbi_tag(split_words)
                 self.alerts.append({
                     "type": "SEGMENT-ALERT",
@@ -968,7 +999,7 @@ class LiveEditorSession:
         if not did_split:
             word, spell_fixed = token, False
             # --- SPELL-ALERT (only if still not in vocab) ---
-            if word not in self.m.spelling.vocab:
+            if word not in vocab:
                 corrected, changed = self.m.spelling.correct_nonword(word, method='b')
                 if changed:
                     self.alerts.append({
@@ -988,6 +1019,8 @@ class LiveEditorSession:
             self.all_tokens.append(w)
             self.token_events.append(ev)
             self.window.append(w)
+        if ends_sentence:
+            self._mark_boundary()
         self._since_trigger += len(out_words)
 
         if self._since_trigger >= self.n_trigger:
@@ -1039,10 +1072,20 @@ class LiveEditorSession:
 # End-of-passage analysis (Part 4)
 # ======================================================================
 
-def split_into_sentences(tokens, sentence_len_range=(6, 12), rng=None):
-    """The simulated stream has no punctuation, so chunk it into pseudo-sentences of a
-    random plausible length for the end-of-passage table."""
+def split_into_sentences(tokens, boundaries=None, max_len=30, sentence_len_range=(6, 12), rng=None):
+    """Use real sentence ends (tokens typed with . ! ?) when known; very long sentences are
+    chunked to max_len so CKY stays fast. With no boundaries (unpunctuated text) fall back to
+    random pseudo-sentences."""
     rng = rng or random
+    if boundaries:
+        cuts = sorted(b for b in boundaries if 0 < b < len(tokens)) + [len(tokens)]
+        sentences, prev = [], 0
+        for c in cuts:
+            seg = tokens[prev:c]
+            prev = c
+            for i in range(0, len(seg), max_len):
+                sentences.append(seg[i:i + max_len])
+        return [s for s in sentences if s]
     sentences, i = [], 0
     while i < len(tokens):
         n = rng.randint(*sentence_len_range)
@@ -1054,7 +1097,7 @@ def split_into_sentences(tokens, sentence_len_range=(6, 12), rng=None):
 def analyze_passage(session: LiveEditorSession, models: Models):
     """Split the corrected token stream into sentences, score each with PCFG / bigram /
     trigram, apply the decision rule, and build the per-sentence summary rows."""
-    sentences = split_into_sentences(session.all_tokens)
+    sentences = split_into_sentences(session.all_tokens, session.boundaries)
     rows = []
     threshold = models.sentence_ppl_threshold
     offset = 0
@@ -1067,6 +1110,9 @@ def analyze_passage(session: LiveEditorSession, models: Models):
         tri_ppl = models.q4_trigram_lm.perplexity(sent)
         n_suspect = count_suspect_tokens(sent, models.spelling.vocab)
         method, verdict = choose_verdict(pcfg_lp, bi_ppl, tri_ppl, threshold, n_suspect)
+        # tagset reconciliation: Q1 tags vs the PCFG parse's tags, compared in Universal space
+        agree = reconcile_tags(list(zip(sent, models.hmm.viterbi_tag(sent))), tree)
+        tag_agree = f"{sum(r[3] for r in agree)}/{len(agree)}" if agree else "n/a"
         rows.append({
             "sentence": " ".join(sent),
             "pcfg_result": f"{pcfg_lp:.2f}" if pcfg_lp is not None else "unparseable",
@@ -1075,6 +1121,7 @@ def analyze_passage(session: LiveEditorSession, models: Models):
             "chosen_method": method,
             "verdict": verdict,
             "suspect_tokens": n_suspect,
+            "q1_pcfg_tag_agreement": tag_agree,
             "segmentation_merges_resolved": sum(1 for m_, _ in events if m_),
             "spelling_corrections_applied": sum(1 for _, s_ in events if s_),
         })
@@ -1123,3 +1170,80 @@ def speed_demon_benchmark(models: Models, batch_size=1000):
         "n_grammar_windows": len(windows),
         "avg_grammar_window_ms": (time_grammar_only / len(windows) * 1000) if windows else 0.0,
     }
+
+
+# ======================================================================
+# E. Extras: model cache, random passage sampler, k tuning
+# ======================================================================
+
+CACHE_VERSION = "q4-v2"
+_FALLBACK_PASSAGE = ("The quick brown fox jumps over the lazy dog. She eats a green salad with "
+                     "her friends every day. Please meet me at the station. I have a good feeling "
+                     "about this. The cat sat on the mat.")
+
+
+def load_or_build_models(path="models_cache.pkl", **kw):
+    """Train once, pickle, and reload on later runs (delete the file after changing the code)."""
+    try:
+        with open(path, "rb") as f:
+            version, models, held = pickle.load(f)
+        if version == CACHE_VERSION:
+            return models, held
+    except Exception:
+        pass
+    models, held = build_models(**kw)
+    try:
+        with open(path, "wb") as f:
+            pickle.dump((CACHE_VERSION, models, held), f)
+    except Exception:
+        pass
+    return models, held
+
+
+def _clean_sentence(tokens):
+    words = [t for t in tokens if t.isalpha()]
+    if words and tokens and tokens[-1] in (".", "!", "?"):
+        words[-1] += tokens[-1]
+    return words
+
+
+def sample_random_passage(n_sentences=None, rng=None):
+    """Random contiguous 5-8 sentence passage from Gutenberg, Brown or Reuters.
+    Returns (source_label, text). Unseeded by default, so every call differs."""
+    rng = rng or random.Random()
+    n = n_sentences or rng.randint(5, 8)
+    try:
+        import nltk
+        names = ["gutenberg", "brown", "reuters"]
+        rng.shuffle(names)
+        for name in names:
+            try:
+                nltk.download(name, quiet=True)
+                corpus = getattr(nltk.corpus, name)
+                fids = corpus.fileids()
+                for _ in range(30):
+                    fid = rng.choice(fids)
+                    sents = corpus.sents(fid)
+                    if len(sents) < n:
+                        continue
+                    start = rng.randrange(len(sents) - n + 1)
+                    chunk = [_clean_sentence(s) for s in sents[start:start + n]]
+                    if all(4 <= len(c) <= 30 for c in chunk):
+                        return f"{name}: {fid}", " ".join(" ".join(c) for c in chunk)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return "built-in fallback", _FALLBACK_PASSAGE
+
+
+def tune_k(sentences_of_words, ks=(0.01, 0.05, 0.1, 0.3, 0.5, 1.0), heldout_frac=0.2, max_eval=500):
+    """Mean held-out trigram perplexity per k. Use the table to justify the chosen ADD_K."""
+    cut = int(len(sentences_of_words) * (1 - heldout_frac))
+    train, held = sentences_of_words[:cut], [s for s in sentences_of_words[cut:] if s][:max_eval]
+    out = {}
+    for k in ks:
+        lm = TrigramLM(k=k)
+        lm.train(train)
+        out[k] = sum(lm.perplexity(s) for s in held) / max(len(held), 1)
+    return out
