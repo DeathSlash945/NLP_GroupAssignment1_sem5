@@ -818,6 +818,14 @@ def count_suspect_tokens(sentence, vocab):
     return sum(1 for w in sentence if w not in vocab or (len(w) == 1 and w not in ("a", "i")))
 
 
+def incomplete_ending_reason(sent, hmm):
+    """Reason string if the sentence ends on a preposition, determiner, conjunction or 'to'
+    (a strong sign of a fragment that n-gram perplexity and a permissive PCFG both miss)."""
+    if len(sent) >= 2 and hmm.viterbi_tag(sent)[-1] in ("ADP", "DET", "CONJ", "PRT"):
+        return f"ends on function word '{sent[-1]}', looks incomplete"
+    return None
+
+
 def choose_verdict(pcfg_logprob, bigram_ppl, trigram_ppl, ppl_alert_threshold, n_suspect=0):
     """Documented decision rule:
        1. If the PCFG parsed the sentence, it is the chosen method. A parse is NECESSARY but
@@ -976,8 +984,9 @@ class LiveEditorSession:
         ppl = m.q4_trigram_lm.perplexity(sent)
         if ppl > m.sentence_ppl_threshold:
             reasons.append(f"trigram-ppl {ppl:.1f} > threshold {m.sentence_ppl_threshold:.0f}")
-        if m.hmm.viterbi_tag(sent)[-1] in ("ADP", "DET", "CONJ", "PRT"):
-            reasons.append(f"ends on function word '{sent[-1]}', looks incomplete")
+        r = incomplete_ending_reason(sent, m.hmm)
+        if r:
+            reasons.append(r)
         if count_suspect_tokens(sent, m.spelling.vocab):
             reasons.append("contains suspect tokens")
         if reasons:
@@ -1142,6 +1151,9 @@ def analyze_passage(session: LiveEditorSession, models: Models):
         tri_ppl = models.q4_trigram_lm.perplexity(sent)
         n_suspect = count_suspect_tokens(sent, models.spelling.vocab)
         method, verdict = choose_verdict(pcfg_lp, bi_ppl, tri_ppl, threshold, n_suspect)
+        incomplete = incomplete_ending_reason(sent, models.hmm)
+        if incomplete:                       # overrides OK from PCFG/n-gram scores
+            verdict = "FLAGGED"
         # tagset reconciliation: Q1 tags vs the PCFG parse's tags, compared in Universal space
         agree = reconcile_tags(list(zip(sent, models.hmm.viterbi_tag(sent))), tree)
         tag_agree = f"{sum(r[3] for r in agree)}/{len(agree)}" if agree else "n/a"
@@ -1153,6 +1165,7 @@ def analyze_passage(session: LiveEditorSession, models: Models):
             "chosen_method": method,
             "verdict": verdict,
             "suspect_tokens": n_suspect,
+            "flag_reason": incomplete or "",
             "q1_pcfg_tag_agreement": tag_agree,
             "segmentation_merges_resolved": sum(1 for m_, _ in events if m_),
             "spelling_corrections_applied": sum(1 for _, s_ in events if s_),
